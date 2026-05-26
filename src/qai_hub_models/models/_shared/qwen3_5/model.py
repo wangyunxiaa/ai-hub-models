@@ -34,23 +34,96 @@ if TYPE_CHECKING:
 import qai_hub as hub
 from packaging.version import Version
 from transformers import PretrainedConfig, PreTrainedTokenizer
-from transformers.cache_utils import DynamicCache
 from transformers.modeling_attn_mask_utils import AttentionMaskConverter
 from transformers.models.qwen3_5 import modeling_qwen3_5
 
 from qai_hub_models.models._shared.llm.common import LLMIOType
-from qai_hub_models.utils.aimet.config_loader import get_aimet_config_path
+from qai_hub_models.models._shared.llm.sha_dynamic_kvcache import (
+    SHADynamicCacheNewValueOnly,
+)
 from qai_hub_models.models._shared.qwen3_5.model_adaptations import (
     QcQwen3_5_apply_rotary_pos_emb,
     QCQwen3_5ForCausalLM,
     QCQwen3_5GatedDeltaNet,
     QCQwen3_5MLP,
     SHAQwen3_5Attention,
+    patched_qwen3_5_decoder_layer_forward,
     patched_qwen3_5_text_model_forward,
 )
+from qai_hub_models.utils.aimet.config_loader import get_aimet_config_path
 from qai_hub_models.utils.aimet.encodings import propagate_memory_encodings
 from qai_hub_models.utils.base_model import Precision
 from qai_hub_models.utils.input_spec import InputSpec
+
+import re as _re
+
+
+class StateSchemaMode(str, Enum):
+    KV = "kv"
+    HYBRID = "hybrid"
+
+
+_STATE_NAME_PATTERNS = {
+    "past_key": _re.compile(r"^past_key_(\d+)_(in|out)$"),
+    "past_value": _re.compile(r"^past_value_(\d+)_(in|out)$"),
+    "conv_state": _re.compile(r"^conv_state_(\d+)_(in|out)$"),
+    "recurrent_state": _re.compile(r"^recurrent_state_(\d+)_(in|out)$"),
+}
+_LINEAR_STATE_KINDS = {"conv_state", "recurrent_state"}
+
+
+def _is_state_tensor_name(
+    name: str,
+    state_schema_mode: StateSchemaMode = StateSchemaMode.HYBRID,
+) -> bool:
+    for state_kind, pattern in _STATE_NAME_PATTERNS.items():
+        match = pattern.match(name)
+        if match is None:
+            continue
+        if state_schema_mode == StateSchemaMode.KV and state_kind in _LINEAR_STATE_KINDS:
+            return False
+        return True
+    return False
+
+
+def get_state_tensor_names(
+    names: list[str],
+    state_schema_mode: StateSchemaMode = StateSchemaMode.HYBRID,
+) -> list[str]:
+    return [name for name in names if _is_state_tensor_name(name, state_schema_mode)]
+
+
+def shift_kv_state_tensors(
+    past_key_vals: list[torch.Tensor],
+    new_key_vals: list[torch.Tensor],
+    length: int,
+    device: torch.device = torch.device("cpu"),
+) -> list[torch.Tensor]:
+    ret = []
+    if len(past_key_vals) == 0:
+        for i in range(0, len(new_key_vals), 2):
+            orig_key_shape = new_key_vals[i].shape
+            key_shape = (orig_key_shape[0], orig_key_shape[1], orig_key_shape[2], 0)
+            past_key_vals.append(torch.zeros(key_shape, device=device))
+            orig_value_shape = new_key_vals[i + 1].shape
+            value_shape = (orig_value_shape[0], orig_value_shape[1], 0, orig_value_shape[3])
+            past_key_vals.append(torch.zeros(value_shape, device=device))
+    if len(new_key_vals) == 0:
+        for i in range(0, len(past_key_vals), 2):
+            orig_key_shape = past_key_vals[i].shape
+            key_shape = (orig_key_shape[0], orig_key_shape[1], orig_key_shape[2], 0)
+            new_key_vals.append(torch.zeros(key_shape, device=device))
+            orig_value_shape = past_key_vals[i + 1].shape
+            value_shape = (orig_value_shape[0], orig_value_shape[1], 0, orig_value_shape[3])
+            new_key_vals.append(torch.zeros(value_shape, device=device))
+    for i in range(0, len(past_key_vals), 2):
+        key_cache = torch.cat([past_key_vals[i].to(device), new_key_vals[i].to(device)], dim=3)
+        key_cache = key_cache[:, :, :, -length:]
+        val_cache = torch.cat([past_key_vals[i + 1].to(device), new_key_vals[i + 1].to(device)], dim=2)
+        val_cache = val_cache[:, :, -length:, :]
+        ret.append(key_cache)
+        ret.append(val_cache)
+    return ret
 
 MODEL_ID = __name__.split(".")[-2]
 MODEL_ASSET_VERSION = 1
@@ -135,9 +208,10 @@ class Qwen3_5RopeEmbedding:
 
 
 class Qwen3_5Base(LLMBase):
+    state_schema_mode = StateSchemaMode.HYBRID
+    llm_io_type: LLMIOType = LLMIOType.genie_input_embeds
     LMClass = modeling_qwen3_5.Qwen3_5ForCausalLM
     EmbeddingClass = Qwen3_5RopeEmbedding
-    llm_io_type = LLMIOType.genie_input_embeds
 
     default_user_prompt = "What is gravity? Keep the answer under ten words."
     default_system_prompt = "You are a helpful AI assistant."
@@ -203,11 +277,44 @@ class Qwen3_5Base(LLMBase):
             )
         modeling_qwen3_5.apply_rotary_pos_emb = QcQwen3_5_apply_rotary_pos_emb  # type: ignore[attr-defined, unused-ignore]
 
+        def _prepare_qwen3_5_rmsnorm_export(self: modeling_qwen3_5.Qwen3_5RMSNorm) -> None:
+            if getattr(self, "_export_weight_folded", False):
+                return
+            self.weight.data.add_(1.0)
+            self._export_weight_folded = True
+
+        def Qwen3_5RMSNorm_forward(
+            self: modeling_qwen3_5.Qwen3_5RMSNorm, hidden_states: torch.Tensor
+        ) -> torch.Tensor:
+            added_dims = max(0, 4 - hidden_states.dim())
+            for _ in range(added_dims):
+                hidden_states = hidden_states.unsqueeze(0)
+            variance = hidden_states.pow(2).mean(-1, keepdim=True)
+            eps = getattr(self, "variance_epsilon", self.eps)
+            hidden_states = hidden_states * torch.rsqrt(variance + eps)
+            assert getattr(self, "_export_weight_folded", False), (
+                "Qwen3.5 RMSNorm weight must be folded before forward/export."
+            )
+            hidden_states = hidden_states * self.weight
+            for _ in range(added_dims):
+                hidden_states = hidden_states.squeeze(0)
+            return hidden_states
+
+        if (
+            skip_optimizations
+            and Qwen3_5_Optimizations.RMS_NORM_4_RANK in skip_optimizations
+        ):
+            print("Skip rank4_rms_norm optimization")
+        else:
+            modeling_qwen3_5.Qwen3_5RMSNorm.forward = Qwen3_5RMSNorm_forward
+            modeling_qwen3_5.Qwen3_5RMSNorm.prepare_export = _prepare_qwen3_5_rmsnorm_export  # type: ignore[attr-defined, unused-ignore]
+
         modeling_qwen3_5.Qwen3_5MLP = QCQwen3_5MLP  # type: ignore[misc, unused-ignore]
         modeling_qwen3_5.Qwen3_5ForCausalLM = QCQwen3_5ForCausalLM  # type: ignore[misc, unused-ignore]
         modeling_qwen3_5.Qwen3_5GatedDeltaNet = QCQwen3_5GatedDeltaNet  # type: ignore[misc, unused-ignore]
+        Qwen3_5Base.LMClass = QCQwen3_5ForCausalLM
 
-        # Patch TextModel forward to handle pre-computed (cos, sin) position embeddings
+        modeling_qwen3_5.Qwen3_5DecoderLayer.forward = patched_qwen3_5_decoder_layer_forward  # type: ignore[assignment, unused-ignore]
         modeling_qwen3_5.Qwen3_5TextModel.forward = patched_qwen3_5_text_model_forward  # type: ignore[assignment, unused-ignore]
 
     def _verify_ckpt(self) -> None:
@@ -255,104 +362,40 @@ class Qwen3_5Base(LLMBase):
         attention_mask: torch.Tensor,
         *rest: torch.Tensor,
     ) -> list[torch.Tensor]:
-        """
-        Forward pass for hybrid Qwen3.5 model with both attention and linear layers.
-
-        Supports two modes based on the number of state tensors provided:
-
-        1. **KV-only mode** (FP eval via generator): state tensors contain only
-           KV cache for full_attention layers. Linear attention state is managed
-           internally. Outputs only KV cache for full_attention layers.
-
-        2. **Hybrid mode** (ONNX export): state tensors contain entries for ALL
-           layers (KV cache for full_attention, conv/recurrent for linear_attention).
-           Outputs state for all layers.
-        """
-        # Unpack position embeddings
         if self.llm_io_type == LLMIOType.huggingface_input_ids:
             position_ids = rest[0]
             state_tensors = rest[1:]
         else:
-            position_ids = rest[:2]  # (cos, sin) tuple
+            position_ids = rest[:2]
             state_tensors = rest[2:]
 
         layer_types = self._get_layer_types()
         text_config = self._get_text_config()
-        linear_attn_config = self._get_linear_attn_config()
-
-        num_full_attention = sum(1 for lt in layer_types if lt == "full_attention")
-        num_all_layers = len(layer_types)
-
-        # Detect mode: KV-only (generator) vs hybrid (ONNX export)
-        kv_only_mode = len(state_tensors) == num_full_attention * 2
-        hybrid_mode = len(state_tensors) == num_all_layers * 2
-
-        if not kv_only_mode and not hybrid_mode:
+        expected_num_state_tensors = len(layer_types) * 2
+        if len(state_tensors) != expected_num_state_tensors:
             raise ValueError(
-                f"Expected {num_full_attention * 2} (KV-only) or "
-                f"{num_all_layers * 2} (hybrid) state tensors, "
-                f"got {len(state_tensors)}."
+                f"Expected {expected_num_state_tensors} hybrid state tensors, got {len(state_tensors)}."
             )
 
-        if kv_only_mode:
-            if state_tensors[0].abs().sum() == 0:
-                self._linear_attn_cache.clear()
-
-        cache = DynamicCache(config=text_config)
+        cache = SHADynamicCacheNewValueOnly(config=text_config)
 
         tensor_idx = 0
-        kv_tensor_idx = 0
         for layer_idx, layer_type in enumerate(layer_types):
             if layer_type == "full_attention":
-                if kv_only_mode:
-                    past_key = state_tensors[kv_tensor_idx]
-                    past_value = state_tensors[kv_tensor_idx + 1]
-                    kv_tensor_idx += 2
-                else:
-                    past_key = state_tensors[tensor_idx]
-                    past_value = state_tensors[tensor_idx + 1]
-                    tensor_idx += 2
+                past_key = state_tensors[tensor_idx]
+                past_value = state_tensors[tensor_idx + 1]
+                tensor_idx += 2
 
                 k = past_key.permute(1, 0, 3, 2)
                 v = past_value.permute(1, 0, 2, 3)
                 cache.update(k, v, layer_idx)
             else:
-                if hybrid_mode:
-                    conv_state = state_tensors[tensor_idx]
-                    recurrent_state = state_tensors[tensor_idx + 1]
-                    tensor_idx += 2
-                else:
-                    if layer_idx in self._linear_attn_cache:
-                        conv_state, recurrent_state = self._linear_attn_cache[layer_idx]
-                    else:
-                        conv_kernel_dim = linear_attn_config["linear_conv_kernel_dim"]
-                        key_dim = (
-                            linear_attn_config["linear_num_key_heads"]
-                            * linear_attn_config["linear_key_head_dim"]
-                        )
-                        value_dim = (
-                            linear_attn_config["linear_num_value_heads"]
-                            * linear_attn_config["linear_value_head_dim"]
-                        )
-                        conv_dim = key_dim * 2 + value_dim
-                        num_v_heads = linear_attn_config["linear_num_value_heads"]
-                        k_head_dim = linear_attn_config["linear_key_head_dim"]
-                        v_head_dim = linear_attn_config["linear_value_head_dim"]
-
-                        conv_state = torch.zeros(
-                            1, conv_dim, conv_kernel_dim - 1,
-                            device=input_tokens.device,
-                            dtype=torch.float32,
-                        )
-                        recurrent_state = torch.zeros(
-                            1, num_v_heads, k_head_dim, v_head_dim,
-                            device=input_tokens.device,
-                            dtype=torch.float32,
-                        )
+                conv_state = state_tensors[tensor_idx]
+                recurrent_state = state_tensors[tensor_idx + 1]
+                tensor_idx += 2
                 cache.update_conv_state(conv_state, layer_idx)
                 cache.update_recurrent_state(recurrent_state, layer_idx)
 
-        # Run model
         model_kwargs: dict[str, Any] = {
             self.main_input_name: input_tokens,
             "attention_mask": self.attention_mask_multiplier * attention_mask,
@@ -361,12 +404,8 @@ class Qwen3_5Base(LLMBase):
         }
         out = self.model(**model_kwargs)
 
-        # Extract output states
         out_cache = out["past_key_values"]
         flat_output_states: list[torch.Tensor] = []
-
-        if kv_only_mode:
-            self._linear_attn_cache.clear()
 
         for layer_idx, layer_type in enumerate(layer_types):
             if layer_type == "full_attention":
@@ -382,18 +421,15 @@ class Qwen3_5Base(LLMBase):
                 flat_output_states.append(k_out)
                 flat_output_states.append(v_out)
             else:
-                layer_cache = out_cache.layers[layer_idx]
-                conv_state_out = layer_cache.conv_states
-                recurrent_state_out = layer_cache.recurrent_states
-
-                if kv_only_mode:
-                    self._linear_attn_cache[layer_idx] = (
-                        conv_state_out.detach(),
-                        recurrent_state_out.detach(),
-                    )
+                if hasattr(out_cache, "conv_states"):
+                    conv_state_out = out_cache.conv_states[layer_idx]
+                    recurrent_state_out = out_cache.recurrent_states[layer_idx]
                 else:
-                    flat_output_states.append(conv_state_out)
-                    flat_output_states.append(recurrent_state_out)
+                    layer_cache = out_cache.layers[layer_idx]
+                    conv_state_out = layer_cache.conv_states
+                    recurrent_state_out = layer_cache.recurrent_states
+                flat_output_states.append(conv_state_out)
+                flat_output_states.append(recurrent_state_out)
 
         return [out["logits"], *flat_output_states]
 
@@ -500,9 +536,8 @@ class Qwen3_5Base(LLMBase):
                     "float32",
                 )
             elif not kv_only:
-                # GatedDeltaNet state (only for ONNX export, not FP eval)
                 input_spec[f"conv_state_{i}_in"] = (
-                    (1, conv_dim, conv_kernel_dim - 1),
+                    (1, conv_dim, conv_kernel_dim),
                     "float32",
                 )
                 input_spec[f"recurrent_state_{i}_in"] = (
@@ -543,10 +578,12 @@ class Qwen3_5PositionProcessor(PositionProcessorBase):
 
 
 class Qwen3_5Base_AIMETOnnx(LLM_AIMETOnnx):
+    state_schema_mode = StateSchemaMode.HYBRID
     EmbeddingClass = Qwen3_5RopeEmbedding
     FPModel = Qwen3_5Base
+    split_embedding = False
 
-    ada_scale_model_type: str | None = "qwen3_5"
+    ada_scale_model_type: str | None = "qwen3"
 
     @classmethod
     def attention_mask_min_clip_and_multiplier(
@@ -601,6 +638,99 @@ class Qwen3_5Base_AIMETOnnx(LLM_AIMETOnnx):
             "linear_num_key_heads": getattr(text_config, "linear_num_key_heads", 16),
             "linear_num_value_heads": getattr(text_config, "linear_num_value_heads", 16),
         }
+
+    def get_calibration_data(
+        self,
+        num_samples: int = 0,
+        input_spec: InputSpec | None = None,
+    ) -> "DatasetEntries | None":
+        import math
+
+        import numpy as np
+        from torch.utils.data import DataLoader
+        from tqdm import tqdm
+
+        from qai_hub_models.datasets import get_dataset_from_name
+        from qai_hub_models.datasets.common import DatasetSplit
+        from qai_hub_models.models._shared.llm.generator import LLM_Generator
+        from qai_hub_models.utils.qai_hub_helpers import make_hub_dataset_entries
+        from qai_hub_models.utils.runtime_torch_wrapper import kwargs_to_dict
+
+        if num_samples == 0:
+            num_samples = math.ceil(80000 / self.context_length)
+
+        dataset = get_dataset_from_name(
+            name="wikitext",
+            split=DatasetSplit.TRAIN,
+            tokenizer=self.tokenizer,
+            block_size=self.sequence_length,
+            context_length=self.context_length,
+            num_samples=num_samples,
+        )
+        dataloader = DataLoader(dataset, batch_size=1, collate_fn=dataset.collate_fn)
+
+        input_spec = self.get_input_spec(
+            llm_config=self.llm_config.to_dict(),
+            sequence_length=self.sequence_length,
+            context_length=self.context_length,
+            llm_io_type=self.llm_io_type,
+        )
+        assert input_spec is not None
+
+        assert self.EmbeddingClass is not None
+        rope_embeddings = self.EmbeddingClass(
+            max_length=self.context_length, config=self.llm_config
+        )
+        generator = LLM_Generator(
+            [self],
+            self.tokenizer,
+            rope_embeddings,
+        )
+
+        all_input_names = list(input_spec.keys())
+        mamba_state_names = [
+            k for k in all_input_names
+            if k.startswith("conv_state_") or k.startswith("recurrent_state_")
+        ]
+        non_mamba_names = [
+            k for k in all_input_names
+            if k not in mamba_state_names
+        ]
+
+        with self.remove_quantization():
+            all_inputs: dict[str, list[np.ndarray]] | None = None
+            for sample in tqdm(
+                dataloader, total=len(dataloader), desc="Pre-filling calibration data"
+            ):
+                input_ids, attention_mask, _ = sample
+                self._linear_attn_cache.clear()
+                for prefilled_inputs in generator.prefill(input_ids, attention_mask):
+                    if all_inputs is None:
+                        all_inputs = {name: [] for name in all_input_names}
+
+                    non_mamba_dict = kwargs_to_dict(non_mamba_names, *prefilled_inputs)
+                    for name in non_mamba_names:
+                        all_inputs[name].append(
+                            non_mamba_dict[name].cpu().detach().numpy()
+                            if isinstance(non_mamba_dict[name], torch.Tensor)
+                            else non_mamba_dict[name]
+                        )
+
+                    for name in mamba_state_names:
+                        layer_idx = int(name.split("_")[2])
+                        if layer_idx in self._linear_attn_cache:
+                            conv_state, recurrent_state = self._linear_attn_cache[layer_idx]
+                            if "conv_state" in name:
+                                all_inputs[name].append(conv_state.numpy())
+                            else:
+                                all_inputs[name].append(recurrent_state.numpy())
+                        else:
+                            shape, dtype = input_spec[name]
+                            all_inputs[name].append(np.zeros(shape, dtype=dtype))
+
+        assert all_inputs is not None
+        tensors_tuple = tuple(all_inputs[name] for name in all_input_names)
+        return make_hub_dataset_entries(tensors_tuple, all_input_names)
 
     @staticmethod
     def _get_output_names(
@@ -741,37 +871,35 @@ class Qwen3_5Base_AIMETOnnx(LLM_AIMETOnnx):
 
         assert self.quant_sim is not None
         session = self.quant_sim.session
-        input_infos = {
-            inp.name: inp
-            for inp in session.get_inputs()
-        }
-        input_names = list(input_infos.keys())
+        onnx_input_names = [inp.name for inp in session.get_inputs()]
 
-        mamba_state_inputs = {
-            name for name in input_names
-            if "conv_state" in name or "recurrent_state" in name
-        }
-        non_mamba_names = [n for n in input_names if n not in mamba_state_inputs]
-
-        mamba_state_shapes = {}
-        for name in mamba_state_inputs:
-            mamba_state_shapes[name] = [
-                d if isinstance(d, int) else 1 for d in input_infos[name].shape
-            ]
+        calib_input_spec = self.get_input_spec(
+            llm_config=self.llm_config.to_dict(),
+            sequence_length=self.sequence_length,
+            context_length=self.context_length,
+            llm_io_type=self.llm_io_type,
+        )
+        calib_input_names = list(calib_input_spec.keys())
 
         onnx_data = []
         n = min(len(data), num_batches)
         for batch in tqdm(itertools.islice(data, n), total=n):
             batch_list = list(batch)
-            provided = kwargs_to_dict(non_mamba_names, *batch_list)
-
+            calib_dict = kwargs_to_dict(calib_input_names, *batch_list)
             entry: dict[str, Any] = {}
-            for name in input_names:
-                if name in mamba_state_inputs:
-                    entry[name] = np.zeros(mamba_state_shapes[name], dtype=np.float32)
+            for name in onnx_input_names:
+                if name in calib_dict:
+                    val = calib_dict[name]
+                    if isinstance(val, torch.Tensor):
+                        entry[name] = val.cpu().detach().numpy()
+                    elif isinstance(val, np.ndarray):
+                        entry[name] = val
+                    else:
+                        entry[name] = np.array(val)
                 else:
-                    entry[name] = provided[name].cpu().detach().numpy()
-
+                    inp_info = next(inp for inp in session.get_inputs() if inp.name == name)
+                    shape = [d if isinstance(d, int) else 1 for d in inp_info.shape]
+                    entry[name] = np.zeros(shape, dtype=np.float32)
             onnx_data.append(entry)
         return onnx_data
 
@@ -882,7 +1010,7 @@ class Qwen3_5Base_AIMETOnnx(LLM_AIMETOnnx):
                     v_head_dim = linear_attn_config["linear_value_head_dim"]
 
                     input_dict[f"conv_state_{i}_in"] = torch.zeros(
-                        1, conv_dim, conv_kernel_dim - 1,
+                        1, conv_dim, conv_kernel_dim,
                         device=input_tokens.device, dtype=torch.float32,
                     )
                     input_dict[f"recurrent_state_{i}_in"] = torch.zeros(
@@ -923,8 +1051,8 @@ class Qwen3_5Base_AIMETOnnx(LLM_AIMETOnnx):
                 conv_out = torch.from_numpy(_get_output(f"conv_state_{i}_out")).detach()
                 rec_out = torch.from_numpy(_get_output(f"recurrent_state_{i}_out")).detach()
                 conv_kernel_dim = linear_attn_config["linear_conv_kernel_dim"]
-                if conv_out.shape[2] > conv_kernel_dim - 1:
-                    conv_out = conv_out[:, :, -(conv_kernel_dim - 1):]
+                if conv_out.shape[2] > conv_kernel_dim:
+                    conv_out = conv_out[:, :, -conv_kernel_dim:]
                 self._linear_attn_cache[i] = (conv_out.cpu(), rec_out.cpu())
 
         return result
@@ -1009,8 +1137,11 @@ class Qwen3_5Base_AIMETOnnx(LLM_AIMETOnnx):
 
 
 class Qwen3_5Base_QNN(LLM_QNN):
+    state_schema_mode = StateSchemaMode.HYBRID
     FPModel = Qwen3_5Base
     EmbeddingClass = Qwen3_5RopeEmbedding
+    llm_io_type: LLMIOType = LLMIOType.genie_input_embeds
+    split_embedding = False
     num_layers_per_split: int
 
     @staticmethod

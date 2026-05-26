@@ -70,6 +70,8 @@ def quantize(
     if fp_checkpoint:
         extra["checkpoint"] = fp_checkpoint
 
+    import time
+    t1 = time.perf_counter()
     fp_model = fp_model_cls.from_pretrained(**extra).to(torch.device("cpu")).eval()
     torch.cuda.empty_cache()
 
@@ -83,6 +85,9 @@ def quantize(
         use_dynamic_shapes=use_dynamic_shapes,
         _skip_quantsim_creation=False,
     )
+    t2 = time.perf_counter()
+    print("===========model_quanted-------------")
+    print(f"creat quant model 耗时: {t2 - t1:.4f} 秒")
 
     # Determine how many samples we need
     num_max_samples = 0
@@ -106,6 +111,11 @@ def quantize(
         print()
         print("NOTE: This quantization technique can take hours to complete.")
 
+    t3 = time.perf_counter()
+    print("===========model_quanted-------------")
+    print(f"creat quant model 耗时: {t2 - t1:.4f} 秒")
+    print("--------Do calibration")
+    print(f"calib_data 耗时: {t3 - t2:.4f} 秒")
     # Do calibration
     model_quant.quantize(
         data=dataloader,
@@ -119,6 +129,9 @@ def quantize(
         spin_quant_num_samples=spin_quant_num_samples,
         spin_quant_num_iterations=spin_quant_num_iterations,
     )
+    print("--------Done calibration")
+    t4 = time.perf_counter()
+    print(f"quant 耗时: {t4 - t3:.4f} 秒")
 
     save_kwargs: dict[str, Any] = dict(fp_model=fp_model)
     # PreSplit models always use dynamic shapes; the mixin handles it internally.

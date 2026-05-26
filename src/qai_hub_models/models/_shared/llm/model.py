@@ -461,7 +461,7 @@ def get_onnx_model(
             extra = {
                 "opset_version": 18,
                 "dynamo": True,
-                "optimize": True,
+                "optimize": False,
                 "dynamic_shapes": dynamic_shapes,
             }
         else:
@@ -1399,6 +1399,8 @@ class LLMBase(BaseModel, LLMConfigEditor, ABC):
                 module.prepare_conv()
             if hasattr(module, "prepare_sha"):
                 module.prepare_sha()
+            if hasattr(module, "prepare_export"):
+                module.prepare_export()
 
         model.to(host_device)
 
@@ -2696,15 +2698,35 @@ class LLM_AIMETOnnx(AIMETOnnxQuantizableMixin, LLMConfigEditor, BaseModel, ABC):
         embedding_table = torch.from_numpy(
             onnx.numpy_helper.to_array(lm_head_weights[0]).copy()
         )
+        if embedding_table.ndim == 4:
+            if embedding_table.shape[-2:] != (1, 1):
+                raise ValueError(
+                    f"Unsupported lm_head conv kernel shape {tuple(embedding_table.shape)} for embeddings"
+                )
+            embedding_table = embedding_table[..., 0, 0]
+        if embedding_table.shape == (self.llm_config.vocab_size, self.llm_config.hidden_size):
+            pass
+        elif embedding_table.shape == (self.llm_config.hidden_size, self.llm_config.vocab_size):
+            embedding_table = embedding_table.T
+        else:
+            raise ValueError(
+                "lm_head weight shape does not match expected embedding table dimensions: "
+                f"got {tuple(embedding_table.shape)}, expected "
+                f"({self.llm_config.vocab_size}, {self.llm_config.hidden_size}) or "
+                f"({self.llm_config.hidden_size}, {self.llm_config.vocab_size})"
+            )
+        embedding_table = embedding_table.contiguous()
         return torch.nn.Embedding(
             self.llm_config.vocab_size,
             self.llm_config.hidden_size,
             self.llm_config.pad_token_id,
-            _weight=embedding_table.T,
+            _weight=embedding_table,
         )
 
     def convert_input_ids_to_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self._get_embedding_table()(input_ids)
+        embedding = self._get_embedding_table()
+        embedding = embedding.to(input_ids.device)
+        return embedding(input_ids)
 
 
 class LLM_QNN(LLMConfigEditor, BaseModel, ABC):
@@ -3019,12 +3041,32 @@ class LLM_QNN(LLMConfigEditor, BaseModel, ABC):
         embedding_table = torch.from_numpy(
             onnx.numpy_helper.to_array(lm_head_weights[0]).copy()
         )
+        if embedding_table.ndim == 4:
+            if embedding_table.shape[-2:] != (1, 1):
+                raise ValueError(
+                    f"Unsupported lm_head conv kernel shape {tuple(embedding_table.shape)} for embeddings"
+                )
+            embedding_table = embedding_table[..., 0, 0]
+        if embedding_table.shape == (self.llm_config.vocab_size, self.llm_config.hidden_size):
+            pass
+        elif embedding_table.shape == (self.llm_config.hidden_size, self.llm_config.vocab_size):
+            embedding_table = embedding_table.T
+        else:
+            raise ValueError(
+                "lm_head weight shape does not match expected embedding table dimensions: "
+                f"got {tuple(embedding_table.shape)}, expected "
+                f"({self.llm_config.vocab_size}, {self.llm_config.hidden_size}) or "
+                f"({self.llm_config.hidden_size}, {self.llm_config.vocab_size})"
+            )
+        embedding_table = embedding_table.contiguous()
         return torch.nn.Embedding(
             self.llm_config.vocab_size,
             self.llm_config.hidden_size,
             self.llm_config.pad_token_id,
-            _weight=embedding_table.T,
+            _weight=embedding_table,
         )
 
     def convert_input_ids_to_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self._get_embedding_table()(input_ids)
+        embedding = self._get_embedding_table()
+        embedding = embedding.to(input_ids.device)
+        return embedding(input_ids)
