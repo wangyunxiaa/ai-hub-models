@@ -458,139 +458,6 @@ class QCQwen3_5GatedDeltaNet(Qwen3_5GatedDeltaNet):
         if not isinstance(self.out_proj, ConvInplaceLinear):
             self.out_proj = ConvInplaceLinear(self.out_proj)
 
-    def prepare_sha(self) -> None:
-        if not (
-            isinstance(self.in_proj_qkv, ConvInplaceLinear)
-            and isinstance(self.in_proj_z, ConvInplaceLinear)
-            and isinstance(self.in_proj_b, ConvInplaceLinear)
-            and isinstance(self.in_proj_a, ConvInplaceLinear)
-        ):
-            raise RuntimeError(
-                "The method 'prepare_sha' cannot be run on model without running 'prepare_conv' first."
-            )
-
-        hidden_size = self.in_proj_qkv.in_features
-
-        if not hasattr(self, "q_proj_sha"):
-            self.q_proj_sha = nn.ModuleList(
-                [
-                    ConvInplaceLinear(
-                        nn.Linear(
-                            hidden_size,
-                            self.head_k_dim,
-                            bias=self.in_proj_qkv.bias is not None,
-                        )
-                    )
-                    for _ in range(self.num_k_heads)
-                ]
-            )
-            self.k_proj_sha = nn.ModuleList(
-                [
-                    ConvInplaceLinear(
-                        nn.Linear(
-                            hidden_size,
-                            self.head_k_dim,
-                            bias=self.in_proj_qkv.bias is not None,
-                        )
-                    )
-                    for _ in range(self.num_k_heads)
-                ]
-            )
-            self.v_proj_sha = nn.ModuleList(
-                [
-                    ConvInplaceLinear(
-                        nn.Linear(
-                            hidden_size,
-                            self.head_v_dim,
-                            bias=self.in_proj_qkv.bias is not None,
-                        )
-                    )
-                    for _ in range(self.num_v_heads)
-                ]
-            )
-            self.z_proj_sha = nn.ModuleList(
-                [
-                    ConvInplaceLinear(
-                        nn.Linear(
-                            hidden_size,
-                            self.head_v_dim,
-                            bias=self.in_proj_z.bias is not None,
-                        )
-                    )
-                    for _ in range(self.num_v_heads)
-                ]
-            )
-            self.b_proj_sha = nn.ModuleList(
-                [
-                    ConvInplaceLinear(
-                        nn.Linear(
-                            hidden_size,
-                            1,
-                            bias=self.in_proj_b.bias is not None,
-                        )
-                    )
-                    for _ in range(self.num_v_heads)
-                ]
-            )
-            self.a_proj_sha = nn.ModuleList(
-                [
-                    ConvInplaceLinear(
-                        nn.Linear(
-                            hidden_size,
-                            1,
-                            bias=self.in_proj_a.bias is not None,
-                        )
-                    )
-                    for _ in range(self.num_v_heads)
-                ]
-            )
-
-        q_end = self.key_dim
-        k_end = self.key_dim * 2
-        for i in range(self.num_k_heads):
-            q_start = i * self.head_k_dim
-            q_stop = (i + 1) * self.head_k_dim
-            k_start = q_end + i * self.head_k_dim
-            k_stop = q_end + (i + 1) * self.head_k_dim
-
-            self.q_proj_sha[i].weight.data.copy_(
-                self.in_proj_qkv.weight[q_start:q_stop, :]
-            )
-            self.k_proj_sha[i].weight.data.copy_(
-                self.in_proj_qkv.weight[k_start:k_stop, :]
-            )
-            if self.in_proj_qkv.bias is not None:
-                assert self.q_proj_sha[i].bias is not None
-                assert self.k_proj_sha[i].bias is not None
-                self.q_proj_sha[i].bias.data.copy_(self.in_proj_qkv.bias[q_start:q_stop])
-                self.k_proj_sha[i].bias.data.copy_(self.in_proj_qkv.bias[k_start:k_stop])
-
-        for i in range(self.num_v_heads):
-            v_start = k_end + i * self.head_v_dim
-            v_stop = k_end + (i + 1) * self.head_v_dim
-            z_start = i * self.head_v_dim
-            z_stop = (i + 1) * self.head_v_dim
-
-            self.v_proj_sha[i].weight.data.copy_(
-                self.in_proj_qkv.weight[v_start:v_stop, :]
-            )
-            self.z_proj_sha[i].weight.data.copy_(self.in_proj_z.weight[z_start:z_stop, :])
-            self.b_proj_sha[i].weight.data.copy_(self.in_proj_b.weight[i : i + 1, :])
-            self.a_proj_sha[i].weight.data.copy_(self.in_proj_a.weight[i : i + 1, :])
-
-            if self.in_proj_qkv.bias is not None:
-                assert self.v_proj_sha[i].bias is not None
-                self.v_proj_sha[i].bias.data.copy_(self.in_proj_qkv.bias[v_start:v_stop])
-            if self.in_proj_z.bias is not None:
-                assert self.z_proj_sha[i].bias is not None
-                self.z_proj_sha[i].bias.data.copy_(self.in_proj_z.bias[z_start:z_stop])
-            if self.in_proj_b.bias is not None:
-                assert self.b_proj_sha[i].bias is not None
-                self.b_proj_sha[i].bias.data.copy_(self.in_proj_b.bias[i : i + 1])
-            if self.in_proj_a.bias is not None:
-                assert self.a_proj_sha[i].bias is not None
-                self.a_proj_sha[i].bias.data.copy_(self.in_proj_a.bias[i : i + 1])
-
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -664,29 +531,13 @@ class QCQwen3_5GatedDeltaNet(Qwen3_5GatedDeltaNet):
 
         batch_size, seq_len, _ = hidden_states.shape
 
-        if hasattr(self, "q_proj_sha"):
-            query_proj = torch.cat(
-                [proj(hidden_states) for proj in self.q_proj_sha], dim=-1
-            )
-            key_proj = torch.cat(
-                [proj(hidden_states) for proj in self.k_proj_sha], dim=-1
-            )
-            value_proj = torch.cat(
-                [proj(hidden_states) for proj in self.v_proj_sha], dim=-1
-            )
-            mixed_qkv = torch.cat((query_proj, key_proj, value_proj), dim=-1)
-        else:
-            mixed_qkv = self.in_proj_qkv(hidden_states)
+        # Use fused projections (no SHA splitting for GatedDeltaNet)
+        mixed_qkv = self.in_proj_qkv(hidden_states)
         mixed_qkv = mixed_qkv.transpose(1, 2)
 
-        if hasattr(self, "z_proj_sha"):
-            z = torch.cat([proj(hidden_states) for proj in self.z_proj_sha], dim=-1)
-            b = torch.cat([proj(hidden_states) for proj in self.b_proj_sha], dim=-1)
-            a = torch.cat([proj(hidden_states) for proj in self.a_proj_sha], dim=-1)
-        else:
-            z = self.in_proj_z(hidden_states)
-            b = self.in_proj_b(hidden_states)
-            a = self.in_proj_a(hidden_states)
+        z = self.in_proj_z(hidden_states)
+        b = self.in_proj_b(hidden_states)
+        a = self.in_proj_a(hidden_states)
         z = z.reshape(batch_size, seq_len, -1, self.head_v_dim)
 
         mixed_qkv, new_conv_state = torch_causal_conv1d_update(

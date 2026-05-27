@@ -99,10 +99,21 @@
     },
     "LayerNorm":
     {
+      "is_output_quantized": "False",
       "per_channel_quantization": "False",
       "params": {
         "weight": {
-          "is_symmetric": "False"
+          "is_quantized": "False"
+        }
+      }
+    },
+    "RMSNormalization":
+    {
+      "is_output_quantized": "False",
+      "per_channel_quantization": "False",
+      "params": {
+        "weight": {
+          "is_quantized": "False"
         }
       }
     },

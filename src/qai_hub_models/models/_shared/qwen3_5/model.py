@@ -811,14 +811,17 @@ class Qwen3_5Base_AIMETOnnx(LLM_AIMETOnnx):
             kv_io_map = _get_kv_io_map(quant_sim)
             quant_sim = _apply_int8_kv_cache_tying_and_lm_head(quant_sim, kv_io_map)
             cls._set_mamba_states_to_float16(quant_sim)
+            cls._set_excluded_params_to_float(quant_sim)
         elif precision == Precision.w4a16:
             kv_io_map = _get_kv_io_map(quant_sim)
             quant_sim = _apply_int8_kv_cache_tying_and_lm_head(quant_sim, kv_io_map)
             cls._set_mamba_states_to_float16(quant_sim)
+            cls._set_excluded_params_to_float(quant_sim)
             cls._set_int4_weights_to_per_block(quant_sim, block_size=32)
         elif precision == Precision.w4:
             _set_lm_head_to_8b(quant_sim)
             cls._set_mamba_states_to_float16(quant_sim)
+            cls._set_excluded_params_to_float(quant_sim)
             cls._set_int4_weights_to_per_block(quant_sim, block_size=32)
             for op_name, qc_op in quant_sim.qc_quantize_op_dict.items():
                 if op_name in quant_sim.activation_names:
@@ -826,6 +829,28 @@ class Qwen3_5Base_AIMETOnnx(LLM_AIMETOnnx):
                     qc_op.data_type = QuantizationDataType.float
                     qc_op.bitwidth = 16
         return quant_sim
+
+    @staticmethod
+    def _set_excluded_params_to_float(quant_sim: "QuantizationSimModel") -> None:
+        """Disable quantization for parameters matching genaimet EXCLUDED_PATTERNS."""
+        from aimet_onnx.common.defs import QuantizationDataType
+
+        excluded_patterns = [
+            _re.compile(r'.*dt_bias$', _re.IGNORECASE),
+            _re.compile(r'.*ssm_conv1d.*', _re.IGNORECASE),
+            _re.compile(r'.*ssm_a$', _re.IGNORECASE),
+            _re.compile(r'.*A_log$', _re.IGNORECASE),
+        ]
+
+        for param_name in quant_sim.param_names:
+            for pattern in excluded_patterns:
+                if pattern.search(param_name):
+                    quantizer = quant_sim.qc_quantize_op_dict.get(param_name)
+                    if quantizer is not None and quantizer.enabled:
+                        quantizer.reset_encoding_stats()
+                        quantizer.data_type = QuantizationDataType.float
+                        quantizer.bitwidth = 16
+                    break
 
     @staticmethod
     def _set_mamba_states_to_float16(quant_sim: "QuantizationSimModel") -> None:
