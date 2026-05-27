@@ -10,7 +10,7 @@ from typing import Any
 
 import torch
 
-from qai_hub_models.models._shared.llm.common import TORCH_DYNAMIC_SHAPE_MIN_VERSION
+from qai_hub_models.models._shared.llm.common import LLMIOType, TORCH_DYNAMIC_SHAPE_MIN_VERSION
 from qai_hub_models.models._shared.llm.model import (
     DEFAULT_CALIBRATION_SEQ_LEN,
     DEFAULT_CONTEXT_LENGTH,
@@ -111,6 +111,135 @@ def quantize(
         print()
         print("NOTE: This quantization technique can take hours to complete.")
 
+    if use_spin_quant:
+        from aimet_onnx.experimental.spinquant import apply_spinquant
+        from onnx import numpy_helper
+        from aimet_onnx.utils import ParamUtils
+
+        def _patched_infer_hidden_size(model, role_map):
+            for op in role_map.embed_tokens:
+                for inp in op.inputs:
+                    if inp.is_parm or inp.is_const:
+                        tensor = ParamUtils.get_param_by_name(model, inp.name)
+                        if tensor is not None:
+                            arr = numpy_helper.to_array(tensor)
+                            if arr.ndim >= 2:
+                                return arr.shape[-1]
+            for op in role_map.lm_head:
+                from aimet_onnx.experimental.spinquant.apply_rotation import _get_weight_product
+                weight_inp, is_transposed = _get_weight_product(op)
+                if weight_inp is not None:
+                    tensor = ParamUtils.get_param_by_name(model, weight_inp.name)
+                    if tensor is not None:
+                        W = numpy_helper.to_array(tensor)
+                        if op.type == "Conv":
+                            return W.shape[1]
+                        return W.shape[-1] if is_transposed else W.shape[0]
+            raise ValueError(
+                "Cannot infer hidden_size: no embed_tokens or lm_head initializer weight found in role_map."
+            )
+
+        import aimet_onnx.experimental.spinquant.apply_rotation as _ar_mod
+        import aimet_onnx.experimental.spinquant.spinquant as _sq_mod
+        _ar_mod._infer_hidden_size = _patched_infer_hidden_size
+        _sq_mod._infer_hidden_size = _patched_infer_hidden_size
+
+        _orig_apply_spinquant = apply_spinquant
+
+        def _patched_apply_spinquant(backbone_sim, visual_sim=None, embedding=None):
+            bb_model = backbone_sim.model.model
+            bb_cg = backbone_sim.connected_graph
+            from aimet_onnx.experimental.spinquant.block_identifier import (
+                get_decoder_block_boundaries,
+                get_decoder_role_map,
+                DecoderBlockRoleMap,
+            )
+            from aimet_onnx.experimental.spinquant.fuse_norm import ActiveNorm
+            bb_boundaries, bb_active_norms = get_decoder_block_boundaries(bb_model, bb_cg)
+            bb_role_map = get_decoder_role_map(bb_cg, bb_boundaries, bb_active_norms)
+            if embedding is not None and bb_role_map.embed_tokens:
+                bb_role_map.embed_tokens = []
+
+            # Filter out linear attention (GatedDeltaNet) ops from role_map.
+            # Qwen3.5 hybrid models have linear_attention layers whose Conv ops
+            # (in_proj_a, in_proj_b, in_proj_z, conv1d, out_proj) have weight
+            # shapes incompatible with SpinQuant's hidden_size validation.
+            # Both fuse_norm and apply_r1_rotation must skip these ops, otherwise
+            # norm gamma gets absorbed into linear_attn weights without a
+            # corresponding R1 rotation, corrupting the model output.
+            _linear_attn_patterns = [
+                "linear_attn/in_proj",
+                "linear_attn/conv1d",
+                "linear_attn/out_proj",
+            ]
+            def _is_linear_attn_op(op):
+                return any(p in op.name for p in _linear_attn_patterns)
+
+            filtered_blocks = []
+            for block in bb_role_map.blocks:
+                filtered_blocks.append(DecoderBlockRoleMap(
+                    qkv_linears=[op for op in block.qkv_linears if not _is_linear_attn_op(op)],
+                    o_proj=[op for op in block.o_proj if not _is_linear_attn_op(op)],
+                    gate_up_linears=[op for op in block.gate_up_linears if not _is_linear_attn_op(op)],
+                    down_proj=[op for op in block.down_proj if not _is_linear_attn_op(op)],
+                ))
+            bb_role_map.blocks = filtered_blocks
+
+            # Also filter active norms: remove downstream_linears that belong to
+            # linear attention layers so fuse_norm_layers_into_linears does not
+            # absorb gamma into their weights.
+            filtered_active_norms = []
+            for an in bb_active_norms:
+                filtered_downstream = [
+                    op for op in an.downstream_linears if not _is_linear_attn_op(op)
+                ]
+                if filtered_downstream:
+                    filtered_active_norms.append(ActiveNorm(
+                        norm_op=an.norm_op,
+                        scale_name=an.scale_name,
+                        downstream_linears=filtered_downstream,
+                    ))
+            bb_active_norms = filtered_active_norms
+
+            bb_hidden_size = _patched_infer_hidden_size(bb_model, bb_role_map)
+
+            from aimet_onnx.experimental.spinquant.apply_rotation import (
+                _validate_backbone_weights,
+                apply_r1_rotation,
+            )
+            from aimet_onnx.common.hadamard import get_hadamard_matrix
+            import numpy as np
+            _validate_backbone_weights(bb_model, bb_role_map, bb_hidden_size)
+
+            from aimet_onnx.experimental.spinquant.fuse_norm import (
+                fuse_norm_layers_into_linears,
+            )
+            fuse_norm_layers_into_linears(bb_model, bb_active_norms)
+            apply_r1_rotation(bb_model, bb_role_map, bb_hidden_size)
+
+            if embedding is not None:
+                R_L = (
+                    get_hadamard_matrix(bb_hidden_size) / np.sqrt(bb_hidden_size)
+                ).astype(np.float64)
+                original_device = embedding.device
+                W = embedding.detach().cpu().numpy()
+                W_rot = (W @ R_L).astype(W.dtype)
+                embedding.data.copy_(torch.from_numpy(W_rot).to(original_device))
+
+            backbone_sim._rebuild_session()
+
+        embedding = None
+        if model_quant.llm_io_type == LLMIOType.genie_input_embeds:
+            input_embeddings = fp_model.model.get_input_embeddings()
+            if input_embeddings is None:
+                raise ValueError(
+                    "SpinQuant requires input embedding weights for genie_input_embeds models."
+                )
+            embedding = input_embeddings.weight.detach().cpu()
+
+        print("Apply SpinQuant")
+        _patched_apply_spinquant(model_quant.quant_sim, embedding=embedding)
+
     t3 = time.perf_counter()
     print("===========model_quanted-------------")
     print(f"creat quant model 耗时: {t2 - t1:.4f} 秒")
@@ -122,7 +251,7 @@ def quantize(
         num_samples=num_samples,
         use_seq_mse=use_seq_mse,
         use_ada_scale=use_ada_scale,
-        use_spin_quant=use_spin_quant,
+        use_spin_quant=False,
         seq_mse_num_samples=seq_mse_num_samples,
         ada_scale_num_samples=ada_scale_num_samples,
         ada_scale_num_iterations=ada_scale_num_iterations,

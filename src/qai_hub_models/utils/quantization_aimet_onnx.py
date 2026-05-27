@@ -772,101 +772,23 @@ class AIMETOnnxQuantizableMixin(PretrainedHubModelProtocol):
         num_iterations: int = 200,
     ) -> None:
         assert self.quant_sim is not None
-        import numpy as np
-        from onnx import numpy_helper
+        from aimet_onnx.experimental.spinquant import apply_spinquant
 
-        print(f"SpinQuant: Learning rotation matrices ({num_iterations} iterations)")
+        embedding = None
+        if self.llm_io_type == LLMIOType.genie_input_embeds:
+            fp_model = self.FPModel.from_pretrained.__func__
+            from qai_hub_models.models._shared.llm.model import LLMBase
+            fp_instance = None
+            try:
+                fp_cls = self.FPModel
+                fp_instance = fp_cls.__new__(fp_cls)
+                embedding_layer = fp_instance.model.get_input_embeddings() if hasattr(fp_instance, 'model') else None
+            except Exception:
+                pass
 
-        model = self.quant_sim.model.model
-
-        initializers = {init.name: init for init in model.graph.initializer}
-
-        qdq_output_to_input = {}
-        for node in model.graph.node:
-            if node.op_type == "QcQuantizeOp" and len(node.input) >= 1 and len(node.output) >= 1:
-                qdq_output_to_input[node.output[0]] = node.input[0]
-
-        weight_entries = []
-        for node in model.graph.node:
-            if node.op_type == "MatMul" and len(node.input) >= 2:
-                weight_input = node.input[1]
-                original_name = qdq_output_to_input.get(weight_input, weight_input)
-                if original_name in initializers:
-                    weight = numpy_helper.to_array(initializers[original_name])
-                    if weight.ndim == 2 and weight.shape[0] >= 16 and weight.shape[1] >= 16:
-                        weight_entries.append((original_name, weight, "matmul"))
-            elif node.op_type == "Conv" and len(node.input) >= 2:
-                weight_input = node.input[1]
-                original_name = qdq_output_to_input.get(weight_input, weight_input)
-                if original_name in initializers:
-                    weight = numpy_helper.to_array(initializers[original_name])
-                    if weight.ndim == 4 and weight.shape[2:] == (1, 1) and weight.shape[0] >= 16 and weight.shape[1] >= 16:
-                        weight_2d = weight.reshape(weight.shape[0], -1)
-                        weight_entries.append((original_name, weight_2d, "conv"))
-
-        if not weight_entries:
-            print("SpinQuant: No eligible weights found, skipping")
-            return
-
-        print(f"SpinQuant: Found {len(weight_entries)} eligible weight matrices")
-
-        rotation_matrices = {}
-        for weight_name, weight, _ in weight_entries:
-            out_dim = weight.shape[0]
-            rng = np.random.RandomState(42)
-            Q = np.linalg.qr(rng.randn(out_dim, out_dim).astype(np.float32))[0]
-            rotation_matrices[weight_name] = Q.astype(np.float32)
-
-        best_loss = float("inf")
-        best_rotations = {k: v.copy() for k, v in rotation_matrices.items()}
-
-        for iteration in range(num_iterations):
-            total_loss = 0.0
-            for weight_name, weight, _ in weight_entries:
-                Q = rotation_matrices[weight_name]
-                rotated_weight = Q @ weight
-
-                channel_max = np.max(np.abs(rotated_weight), axis=1, keepdims=True)
-                channel_max = np.clip(channel_max, 1e-8, None)
-                scale = channel_max / 127.0
-                quantized = np.round(rotated_weight / scale) * scale
-                residual = rotated_weight - quantized
-                loss = np.mean(residual ** 2)
-                total_loss += loss
-
-                grad_rot = 2.0 * residual @ weight.T / (weight.shape[0] * weight.shape[1])
-                step_size = 0.01 / (1.0 + iteration * 0.005)
-                Q_new = Q - step_size * grad_rot
-                U, _, Vt = np.linalg.svd(Q_new, full_matrices=False)
-                rotation_matrices[weight_name] = (U @ Vt).astype(np.float32)
-
-            if total_loss < best_loss:
-                best_loss = total_loss
-                best_rotations = {k: v.copy() for k, v in rotation_matrices.items()}
-
-            if iteration % 50 == 0 or iteration == num_iterations - 1:
-                print(f"  Iteration {iteration}/{num_iterations}, loss={total_loss:.6f}")
-
-        print(f"SpinQuant: Best loss={best_loss:.6f}, applying rotations to weights")
-
-        for weight_name, weight, entry_type in weight_entries:
-            Q = best_rotations[weight_name]
-            rotated_weight = Q @ weight
-
-            if entry_type == "conv":
-                original_shape = numpy_helper.to_array(initializers[weight_name]).shape
-                rotated_weight = rotated_weight.reshape(original_shape)
-
-            rotated_tensor = numpy_helper.from_array(
-                rotated_weight.astype(np.float32), name=weight_name
-            )
-            for i, init in enumerate(model.graph.initializer):
-                if init.name == weight_name:
-                    model.graph.initializer[i].CopyFrom(rotated_tensor)
-                    break
-
-        self.quant_sim._rebuild_session()
-        print("SpinQuant: Rotation matrices applied successfully")
+        print("SpinQuant: Applying Hadamard rotations via AIMET apply_spinquant")
+        apply_spinquant(self.quant_sim, embedding=embedding)
+        print("SpinQuant: Rotations applied successfully")
 
     def _apply_calibration(self, data: DataLoader, num_batches: int) -> None:
         assert self.quant_sim is not None
